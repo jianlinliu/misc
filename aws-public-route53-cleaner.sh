@@ -22,6 +22,10 @@ NC='\033[0m' # No Color
 # Global variables
 ZONE_ID=""
 DELETE_MODE=false
+DOMAIN=""
+
+# Allowlist of keywords. Records containing these will not be deleted.
+ALLOWLIST=("mirror-registry" "quayproxy" "vmc.client-proxy")
 
 # Parse command line arguments
 parse_arguments() {
@@ -30,6 +34,15 @@ parse_arguments() {
             --delete|-d)
                 DELETE_MODE=true
                 shift
+                ;;
+            --domain)
+                if [[ -n "$2" ]]; then
+                    DOMAIN="$2"
+                    shift 2
+                else
+                    echo -e "${RED}Error: --domain requires an argument${NC}"
+                    exit 1
+                fi
                 ;;
             -h|--help)
                 show_help
@@ -53,17 +66,42 @@ show_help() {
     echo "Route53 Zone Cleaner Script"
     echo ""
     echo "Usage:"
-    echo "  $0                    - List all active clusters"
-    echo "  $0 <zone-id>          - Clean up records in specified zone (dry run)"
-    echo "  $0 <zone-id> --delete - Actually delete orphaned records"
+    echo "  $0 --domain <domain.com>                    - List all active clusters for a domain"
+    echo "  $0 --domain <domain.com> [<zone-id>]          - Clean up records in specified zone (dry run)"
+    echo "  $0 --domain <domain.com> [<zone-id>] --delete - Actually delete orphaned records"
     echo ""
     echo "Options:"
+    echo "  --domain        The domain name to check for (e.g., origin-ci-int-aws.dev.rhcloud.com)"
     echo "  -d, --delete    Actually delete records (default is dry run)"
     echo "  -h, --help      Show this help message"
     echo ""
     echo "Example:"
-    echo "  $0 Z2GYOLTZHS5VK"
-    echo "  $0 Z2GYOLTZHS5VK --delete"
+    echo "  $0 --domain origin-ci-int-aws.dev.rhcloud.com"
+    echo "  $0 --domain origin-ci-int-aws.dev.rhcloud.com Z2GYOLTZHS5VK"
+    echo "  $0 --domain origin-ci-int-aws.dev.rhcloud.com Z2GYOLTZHS5VK --delete"
+}
+
+# Function to get the Zone ID for a given domain
+get_zone_id_for_domain() {
+    local domain_name="$1"
+    echo -e "${YELLOW}Searching for Zone ID for domain: ${domain_name}${NC}" >&2
+    
+    # Add a trailing dot for an exact match if it's missing
+    if [[ "${domain_name: -1}" != "." ]]; then
+        domain_name="${domain_name}."
+    fi
+    
+    # Query AWS for the Hosted Zone ID
+    local zone_id
+    zone_id=$(aws route53 list-hosted-zones --query "HostedZones[?Name == '$domain_name'].Id" --output text)
+    
+    if [[ -z "$zone_id" ]]; then
+        echo -e "${RED}Error: Could not find a hosted zone for '${domain_name}'${NC}" >&2
+        exit 1
+    fi
+    
+    # The AWS CLI output is /hostedzone/ZONEID, so we extract just the ID part
+    echo "$zone_id" | sed 's/^\/hostedzone\///'
 }
 
 # Function to get all active cluster IDs
@@ -77,7 +115,7 @@ get_active_clusters() {
     aws route53 list-hosted-zones --query 'HostedZones[].Name' --output text | tr '\t' '\n' > "$temp_file"
     
     # Pattern to match: anything.origin-ci-int-aws.dev.rhcloud.com
-    local pattern="origin-ci-int-aws.dev.rhcloud.com"
+    local pattern="$DOMAIN"
     
     # Array to store cluster IDs
     declare -a cluster_ids=()
@@ -89,8 +127,12 @@ get_active_clusters() {
         
         # Check if zone matches our pattern
         if [[ "$zone" == *"$pattern" ]]; then
+            # Escape domain for regex
+            local escaped_domain
+            escaped_domain=$(echo "$pattern" | sed 's/\./\\./g')
+
             # Extract the cluster ID using regex
-            if [[ "$zone" =~ ^([^.]+)\.origin-ci-int-aws\.dev\.rhcloud\.com$ ]]; then
+            if [[ "$zone" =~ ^([^.]+)\.${escaped_domain}$ ]]; then
                 cluster_ids+=("${BASH_REMATCH[1]}")
             fi
         fi
@@ -175,7 +217,10 @@ cleanup_zone() {
     set +e
     
     local records_to_delete=()
-    local pattern="\.apps\.([^.]+)\.origin-ci-int-aws\.dev\.rhcloud\.com\.$"
+    # Escape domain for regex
+    local escaped_domain
+    escaped_domain=$(echo "$DOMAIN" | sed 's/\./\\./g')
+    local pattern="^(api|api-int|.*\\.apps)\\.([^.]+)\\.${escaped_domain}\\.$"
     local analyzed_count=0
     local orphaned_count=0
     local active_count=0
@@ -248,14 +293,14 @@ cleanup_zone() {
             continue
         fi
         
-        # Check if record matches the apps pattern
+        # Check if record matches the apps or api pattern
         if [[ "$record_name" =~ $pattern ]]; then
             ((analyzed_count++))
-            local cluster_id="${BASH_REMATCH[1]}"
+            local cluster_id="${BASH_REMATCH[2]}"
             
-            # Only process A and AAAA records for deletion
-            if [[ "$record_type" != "A" && "$record_type" != "AAAA" ]]; then
-                echo -e "${BLUE}  ℹ️  SKIPPING: ${record_name} (${record_type}) - only A/AAAA records are deleted${NC}"
+            # Only process A, AAAA, CNAME and TXT records for deletion
+            if [[ "$record_type" != "A" && "$record_type" != "AAAA" && "$record_type" != "TXT" && "$record_type" != "CNAME" ]]; then
+                echo -e "${BLUE}  ℹ️  SKIPPING: ${record_name} (${record_type}) - only A/AAAA/TXT records are deleted${NC}"
                 continue
             fi
             
@@ -269,6 +314,21 @@ cleanup_zone() {
             done
             
             if [[ "$is_active" == "false" ]]; then
+                # Check if the record name is in the allowlist
+                local is_allowlisted=false
+                for keyword in "${ALLOWLIST[@]}"; do
+                    if [[ "$record_name" == *"$keyword"* ]]; then
+                        echo -e "${YELLOW}  - SKIPPING (allowlist): ${record_name} contains '${keyword}'${NC}"
+                        is_allowlisted=true
+                        break # Found a match, no need to check further
+                    fi
+                done
+
+                # If it was allowlisted, skip to the next record
+                if [[ "$is_allowlisted" == "true" ]]; then
+                    continue
+                fi
+
                 ((orphaned_count++))
                 echo -e "${RED}  🗑️  ORPHANED (#${orphaned_count}): ${record_name} (${record_type}) (cluster: ${cluster_id})${NC}"
                 
@@ -323,7 +383,7 @@ EOF
     echo -e "${BLUE}  - Total records processed: ${processed_count}${NC}"
     echo -e "${BLUE}  - Records skipped due to errors: ${skipped_count}${NC}"
     echo -e "${BLUE}Analysis complete:${NC}"
-    echo -e "${BLUE}  - Total app records analyzed: ${analyzed_count}${NC}"
+    echo -e "${BLUE}  - Total matched records analyzed: ${analyzed_count}${NC}"
     echo -e "${GREEN}  - Active records: ${active_count}${NC}"
     echo -e "${RED}  - Orphaned records found: ${orphaned_count}${NC}"
     
@@ -370,6 +430,18 @@ echo -e "${BLUE}=== Route53 Zone Analyzer ===${NC}"
 
 # Parse command line arguments
 parse_arguments "$@"
+
+# Check if domain is provided
+if [[ -z "$DOMAIN" ]]; then
+    echo -e "${RED}Error: --domain parameter is required.${NC}"
+    show_help
+    exit 1
+fi
+
+# If a Zone ID is not provided as an argument, try to find it automatically
+if [[ -z "$ZONE_ID" ]]; then
+    ZONE_ID=$(get_zone_id_for_domain "$DOMAIN")
+fi
 
 # If zone ID is provided, run cleanup mode
 if [[ -n "$ZONE_ID" ]]; then
@@ -420,7 +492,7 @@ echo ""
 
 # Display results
 if [ ${#CLUSTER_IDS[@]} -eq 0 ]; then
-    echo -e "${YELLOW}No clusters found matching the pattern *.${PATTERN}${NC}"
+    echo -e "${YELLOW}No clusters found matching the pattern *.${DOMAIN}${NC}"
 else
     echo -e "${GREEN}=== CLUSTER SUMMARY ===${NC}"
     echo -e "${GREEN}Found ${#CLUSTER_IDS[@]} cluster(s) currently in use:${NC}\n"
