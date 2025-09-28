@@ -265,14 +265,14 @@ oc_release_diff_output_1="${changelog_dir}/payload_${to_tag}_diff_${from_tag}_oc
 mkdir -p "${changelog_dir}"
 
 pushd "${changelog_dir}"
-#run_command "oc adm release info --changelog=. ${repo_with_registry}:${from_tag} ${repo_with_registry}:${to_tag} > '${oc_release_diff_output}'"
-#sed -n '/^###.*\[.*\].*github.com/,$p' "$oc_release_diff_output" > "$oc_release_diff_output_1"
-#sed -i -e "/And [0-9]* elided commits/d" -e "/\[Full changelog\]/d" "$oc_release_diff_output_1"
+run_command "oc adm release info --changelog=. ${repo_with_registry}:${from_tag} ${repo_with_registry}:${to_tag} > '${oc_release_diff_output}'"
+sed -n '/^###.*\[.*\].*github.com/,$p' "$oc_release_diff_output" > "$oc_release_diff_output_1"
+sed -i -e "/And [0-9]* elided commits/d" -e "/\[Full changelog\]/d" "$oc_release_diff_output_1"
 
-#run_command "oc adm release info ${repo_with_registry}:${from_tag} -o json > ${from_tag}.json"
-#run_command "oc adm release info ${repo_with_registry}:${to_tag} -o json > ${to_tag}.json"
-#extract_sort ${from_tag}.json ${from_tag}-commit.json
-#extract_sort ${to_tag}.json ${to_tag}-commit.json
+run_command "oc adm release info ${repo_with_registry}:${from_tag} -o json > ${from_tag}.json"
+run_command "oc adm release info ${repo_with_registry}:${to_tag} -o json > ${to_tag}.json"
+extract_sort ${from_tag}.json ${from_tag}-commit.json
+extract_sort ${to_tag}.json ${to_tag}-commit.json
 
 git_repo_base="github.com/openshift"
 git_release_diff_output="${changelog_dir}/payload_${to_tag}_diff_${from_tag}_git"
